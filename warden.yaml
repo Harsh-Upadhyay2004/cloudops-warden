@@ -1,0 +1,122 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudOps Warden: Serverless Auto-Governance Pipeline'
+
+Parameters:
+  AlertEmail:
+    Type: String
+    Description: "Your email address to receive the FinOps alerts"
+
+Resources:
+  WardenReportBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      WebsiteConfiguration:
+        IndexDocument: report.html
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+
+  WardenBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WardenReportBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action: s3:GetObject
+            Resource: !Sub "${WardenReportBucket.Arn}/*"
+
+  WardenAlertTopic:
+    Type: AWS::SNS::Topic
+    
+  WardenEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Endpoint: !Ref AlertEmail
+      Protocol: email
+      TopicArn: !Ref WardenAlertTopic
+
+  WardenExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AmazonEC2ReadOnlyAccess
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/AmazonSNSFullAccess
+
+  WardenEngineFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt WardenExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 15
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref WardenReportBucket
+          SNS_TOPIC_ARN: !Ref WardenAlertTopic
+      Code:
+        ZipFile: |
+          import boto3, os, datetime
+          
+          def lambda_handler(event, context):
+              ec2, s3, sns = boto3.client('ec2'), boto3.client('s3'), boto3.client('sns')
+              bucket, topic = os.environ['BUCKET_NAME'], os.environ['SNS_TOPIC_ARN']
+              
+              vols = ec2.describe_volumes(Filters=[{'Name': 'status', 'Values': ['available']}])['Volumes']
+              unused_drives = [v['VolumeId'] for v in vols]
+              
+              addrs = ec2.describe_addresses()['Addresses']
+              unused_ips = [a['PublicIp'] for a in addrs if 'InstanceId' not in a]
+              
+              html = f"""
+              <html>
+                  <body style="font-family: sans-serif; padding: 2rem;">
+                      <h1>Cloud Janitor Report</h1>
+                      <p><strong>Generated:</strong> {datetime.datetime.now()}</p>
+                      <hr>
+                      <h2>Wasted Hard Drives:</h2>
+                      <p>{'None' if not unused_drives else '<br>'.join(unused_drives)}</p>
+                      <h2>Wasted IP Addresses:</h2>
+                      <p>{'None' if not unused_ips else '<br>'.join(unused_ips)}</p>
+                  </body>
+              </html>
+              """
+              
+              s3.put_object(Bucket=bucket, Key='report.html', Body=html, ContentType='text/html')
+              sns.publish(TopicArn=topic, Message="Janitor run complete. Check S3.", Subject="CloudOps Warden Alert")
+              return "Success"
+
+  WardenSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: "rate(1 day)"
+      State: "ENABLED"
+      Targets:
+        - Arn: !GetAtt WardenEngineFunction.Arn
+          Id: "WardenEngineTarget"
+
+  WardenInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref WardenEngineFunction
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt WardenSchedule.Arn
+
+Outputs:
+  ReportWebsiteURL:
+    Description: "URL for your live S3 dashboard"
+    Value: !Sub "http://${WardenReportBucket}.s3-website-${AWS::Region}.amazonaws.com/report.html"
