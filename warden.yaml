@@ -1,13 +1,15 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'CloudOps Warden: Serverless Auto-Governance Pipeline'
+Description: 'CloudOps Warden: Serverless Auto-Governance FinOps Pipeline'
 
 Parameters:
   AlertEmail:
     Type: String
-    Description: "Your email address to receive the FinOps alerts"
+    Description: 'The email address to receive daily cost governance alerts'
+    Default: 'h.upadhyay13082004@gmail.com'
 
 Resources:
-  WardenReportBucket:
+  # 1. Amazon S3 Bucket for Hosting the Dashboard Website
+  DashboardBucket:
     Type: AWS::S3::Bucket
     Properties:
       WebsiteConfiguration:
@@ -18,28 +20,30 @@ Resources:
         IgnorePublicAcls: false
         RestrictPublicBuckets: false
 
-  WardenBucketPolicy:
+  # 2. Public Bucket Policy allowing read access to the HTML Report
+  DashboardBucketPolicy:
     Type: AWS::S3::BucketPolicy
     Properties:
-      Bucket: !Ref WardenReportBucket
+      Bucket: !Ref DashboardBucket
       PolicyDocument:
         Version: '2012-10-17'
         Statement:
-          - Effect: Allow
-            Principal: "*"
-            Action: s3:GetObject
-            Resource: !Sub "${WardenReportBucket.Arn}/*"
+          - Sid: PublicReadGetObject
+            Effect: Allow
+            Principal: '*'
+            Action: 's3:GetObject'
+            Resource: !Sub '${DashboardBucket.Arn}/*'
 
-  WardenAlertTopic:
+  # 3. Amazon SNS Topic for sending the Executive Notifications
+  WardenSnsTopic:
     Type: AWS::SNS::Topic
-    
-  WardenEmailSubscription:
-    Type: AWS::SNS::Subscription
     Properties:
-      Endpoint: !Ref AlertEmail
-      Protocol: email
-      TopicArn: !Ref WardenAlertTopic
+      DisplayName: 'CloudOpsWarden'
+      Subscription:
+        - Endpoint: !Ref AlertEmail
+          Protocol: email
 
+  # 4. IAM Dedicated Execution Role for Lambda (Least Privilege)
   WardenExecutionRole:
     Type: AWS::IAM::Role
     Properties:
@@ -48,75 +52,131 @@ Resources:
         Statement:
           - Effect: Allow
             Principal:
-              Service: lambda.amazonaws.com
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-        - arn:aws:iam::aws:policy/AmazonEC2ReadOnlyAccess
-        - arn:aws:iam::aws:policy/AmazonS3FullAccess
-        - arn:aws:iam::aws:policy/AmazonSNSFullAccess
+              Service: [lambda.amazonaws.com]
+            Action: ['sts:AssumeRole']
+          - Effect: Allow
+            Principal:
+              Service: [scheduler.amazonaws.com]
+            Action: ['sts:AssumeRole']
+      Policies:
+        - PolicyName: WardenPermissionsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ec2:DescribeVolumes'
+                  - 'ec2:DescribeAddresses'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 's3:PutObject'
+                  - 's3:PutObjectContentType'
+                Resource: !Sub '${DashboardBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - 'sns:Publish'
+                Resource: !Ref WardenSnsTopic
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: 'arn:aws:logs:*:*:*'
 
+  # 5. AWS Lambda Engine running Python 3.9 (Upgraded Executive Messaging)
   WardenEngineFunction:
     Type: AWS::Lambda::Function
     Properties:
       Handler: index.lambda_handler
-      Role: !GetAtt WardenExecutionRole.Arn
       Runtime: python3.9
-      Timeout: 15
+      Timeout: 60
+      Role: !GetAtt WardenExecutionRole.Arn
       Environment:
         Variables:
-          BUCKET_NAME: !Ref WardenReportBucket
-          SNS_TOPIC_ARN: !Ref WardenAlertTopic
+          BUCKET_NAME: !Ref DashboardBucket
+          SNS_TOPIC_ARN: !Ref WardenSnsTopic
       Code:
         ZipFile: |
           import boto3, os, datetime
           
           def lambda_handler(event, context):
-              ec2, s3, sns = boto3.client('ec2'), boto3.client('s3'), boto3.client('sns')
-              bucket, topic = os.environ['BUCKET_NAME'], os.environ['SNS_TOPIC_ARN']
+              ec2 = boto3.client('ec2')
+              s3 = boto3.client('s3')
+              sns = boto3.client('sns')
               
+              bucket = os.environ['BUCKET_NAME']
+              topic = os.environ['SNS_TOPIC_ARN']
+              region = os.environ['AWS_REGION']
+              
+              # Audit available EBS volumes
               vols = ec2.describe_volumes(Filters=[{'Name': 'status', 'Values': ['available']}])['Volumes']
               unused_drives = [v['VolumeId'] for v in vols]
               
+              # Audit unassociated Elastic IPs
               addrs = ec2.describe_addresses()['Addresses']
               unused_ips = [a['PublicIp'] for a in addrs if 'InstanceId' not in a]
               
+              # 1. Build and push the HTML Dashboard to Amazon S3
               html = f"""
               <html>
-                  <body style="font-family: sans-serif; padding: 2rem;">
-                      <h1>Cloud Janitor Report</h1>
-                      <p><strong>Generated:</strong> {datetime.datetime.now()}</p>
-                      <hr>
-                      <h2>Wasted Hard Drives:</h2>
-                      <p>{'None' if not unused_drives else '<br>'.join(unused_drives)}</p>
-                      <h2>Wasted IP Addresses:</h2>
-                      <p>{'None' if not unused_ips else '<br>'.join(unused_ips)}</p>
+                  <head>
+                      <title>CloudOps Warden Report</title>
+                  </head>
+                  <body style="font-family: Arial, sans-serif; padding: 2rem; background-color: #f8f9fa; color: #333;">
+                      <h1 style="color: #232f3e;">CloudOps Warden: Cost Governance Report</h1>
+                      <p><strong>Execution Timestamp:</strong> {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC</p>
+                      <hr style="border: 0; height: 1px; background: #ccc; margin: 1.5rem 0;">
+                      
+                      <h2 style="color: #d11a2a;">Idle Elastic Block Store (EBS) Volumes ({len(unused_drives)})</h2>
+                      <ul>
+                          {'<li>No idle volumes discovered.</li>' if not unused_drives else ''.join([f'<li>{v}</li>' for v in unused_drives])}
+                      </ul>
+                      
+                      <h2 style="color: #d11a2a;">Unassociated Elastic IP Addresses ({len(unused_ips)})</h2>
+                      <ul>
+                          {'<li>No unassociated Elastic IPs discovered.</li>' if not unused_ips else ''.join([f'<li>{ip}</li>' for ip in unused_ips])}
+                      </ul>
                   </body>
               </html>
               """
-              
               s3.put_object(Bucket=bucket, Key='report.html', Body=html, ContentType='text/html')
-              sns.publish(TopicArn=topic, Message="Janitor run complete. Check S3.", Subject="CloudOps Warden Alert")
+              
+              # 2. Build the Direct Executive Summary Email Body
+              dashboard_url = f"http://{bucket}.s3-website-{region}.amazonaws.com/report.html"
+              
+              email_body = (
+                  f"CloudOps Warden Daily Governance Audit Complete\n"
+                  f"--------------------------------------------------\n\n"
+                  f"Infrastructure Scan Findings Summary:\n"
+                  f"  - Wasted EBS Volumes Found: {len(unused_drives)}\n"
+                  f"  - Wasted Elastic IPs Found: {len(unused_ips)}\n\n"
+                  f"Action Required:\n"
+                  f"Please view the fully detailed interactive reporting dashboard using the official link below:\n"
+                  f"{dashboard_url}\n"
+              )
+              
+              # Send the notification via SNS with your signature block
+              sns.publish(
+                  TopicArn=topic, 
+                  Message=email_body, 
+                  Subject="CloudOps Warden Alert - Harsh Upadhyay"
+              )
               return "Success"
 
-  WardenSchedule:
-    Type: AWS::Events::Rule
+  # 6. EventBridge Scheduler (Runs daily automation Cron trigger)
+  WardenDailySchedule:
+    Type: AWS::Scheduler::Schedule
     Properties:
-      ScheduleExpression: "rate(1 day)"
-      State: "ENABLED"
-      Targets:
-        - Arn: !GetAtt WardenEngineFunction.Arn
-          Id: "WardenEngineTarget"
-
-  WardenInvokePermission:
-    Type: AWS::Lambda::Permission
-    Properties:
-      FunctionName: !Ref WardenEngineFunction
-      Action: "lambda:InvokeFunction"
-      Principal: "events.amazonaws.com"
-      SourceArn: !GetAtt WardenSchedule.Arn
+      Description: 'Triggers the CloudOps Warden Lambda function every single day'
+      ScheduleExpression: 'rate(1 day)'
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      Target:
+        Arn: !GetAtt WardenEngineFunction.Arn
+        RoleArn: !GetAtt WardenExecutionRole.Arn
 
 Outputs:
   ReportWebsiteURL:
-    Description: "URL for your live S3 dashboard"
-    Value: !Sub "http://${WardenReportBucket}.s3-website-${AWS::Region}.amazonaws.com/report.html"
+    Description: 'The live public web URL for the FinOps Governance Dashboard'
+    Value: !GetAtt DashboardBucket.WebServiceURL
